@@ -1,0 +1,15 @@
+{
+  "id": "sme-team",
+  "label": "SME with a small delivery team",
+  "countries": ["ES", "DE", "FR", "NL", "IT", "PL"],
+  "entity_types": ["sme"],
+  "consortium": true,
+  "max_partners": 6,
+  "trl": [4, 8],
+  "cofinancing_max_pct": 40,
+  "amount": [50000, 2000000],
+  "deadline_min_days": 21,
+  "domains_include": ["ai", "data", "cybersecurity", "digital", "manufacturing", "climate"],
+  "domains_exclude": ["clinical-trials"],
+  "requires_physical_infra": false
+}

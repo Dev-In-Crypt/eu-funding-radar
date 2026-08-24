@@ -1,0 +1,15 @@
+{
+  "id": "solo-software",
+  "label": "Solo developer / small studio",
+  "countries": ["ES", "UA", "PL"],
+  "entity_types": ["sme", "startup", "natural_person"],
+  "consortium": false,
+  "max_partners": 2,
+  "trl": [3, 6],
+  "cofinancing_max_pct": 20,
+  "amount": [20000, 300000],
+  "deadline_min_days": 10,
+  "domains_include": ["ai", "data", "cybersecurity", "digital", "open-source"],
+  "domains_exclude": ["agriculture", "construction", "clinical-trials", "maritime-hardware"],
+  "requires_physical_infra": false
+}
