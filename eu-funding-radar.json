@@ -1,0 +1,788 @@
+{
+  "name": "EU Funding Radar (MVP)",
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "Daily 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1200,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "notes": "One run/day is enough for a daily digest. Split into a separate Collector workflow (see README) if you want each source on its own schedule."
+    },
+    {
+      "id": "ftop_fetch",
+      "name": "FTOP: Search Calls",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -960,
+        140
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.tech.ec.europa.eu/search-api/prod/rest/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "apiKey",
+              "value": "SEDIA"
+            },
+            {
+              "name": "text",
+              "value": "***"
+            },
+            {
+              "name": "pageSize",
+              "value": "50"
+            },
+            {
+              "name": "pageNumber",
+              "value": "1"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"query\": {\n    \"bool\": {\n      \"must\": [\n        { \"terms\": { \"type\": [\"1\", \"2\", \"8\"] } },\n        { \"terms\": { \"status\": [\"31094501\", \"31094502\"] } }\n      ]\n    }\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "SEDIA (Funding & Tenders Portal search API) is not officially documented by the Commission. This query/endpoint is reverse-engineered from public usage and can change without notice -- see README > Limitations."
+    },
+    {
+      "id": "ftop_normalize",
+      "name": "FTOP: Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -720,
+        140
+      ],
+      "parameters": {
+        "language": "javaScript",
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Normalize European Commission SEDIA (Funding & Tenders Portal) search\n// results into the project's canonical call schema.\n//\n// The SEDIA search API is not officially documented. Field names below\n// reflect the structure commonly observed on the public search endpoint\n// and may need adjusting if the Commission changes the response shape --\n// this node does NOT fail loudly on schema drift, unlike the HTML source\n// below. That asymmetry is a known limitation, see README > Limitations.\n\nconst body = $input.first().json;\nconst results = body.results || body.data || [];\n\nfunction metaValue(metadata, name) {\n  const m = (metadata || []).find((x) => x.name === name);\n  if (!m) return null;\n  if (Array.isArray(m.values)) return m.values[0] ?? null;\n  return m.value ?? null;\n}\n\nconst out = [];\nfor (const r of results) {\n  const meta = r.metadata || [];\n  const externalId = r.reference || metaValue(meta, 'identifier') || String(r.id || '');\n  if (!externalId) continue;\n\n  const actionType = (metaValue(meta, 'actionType') || '').toLowerCase();\n  const budgetRaw = metaValue(meta, 'budgetOverview') || metaValue(meta, 'callBudget');\n\n  out.push({\n    json: {\n      source_code: 'ftop',\n      external_id: externalId,\n      title: r.title || metaValue(meta, 'title') || '',\n      programme: metaValue(meta, 'programmePeriod') || metaValue(meta, 'frameworkProgramme') || 'Horizon Europe',\n      type: actionType.includes('cascade') ? 'cascade' : 'grant',\n      url: r.url || ('https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/topic-details/' + externalId),\n      summary: r.summary || metaValue(meta, 'abstract') || '',\n      amount_min_eur: null,\n      amount_max_eur: budgetRaw ? (Number(String(budgetRaw).replace(/[^\\d.]/g, '')) || null) : null,\n      deadline: metaValue(meta, 'deadlineDate') || metaValue(meta, 'startDate') || null,\n      deadline_type: actionType.includes('multi') ? 'multiple' : 'single',\n      topics: (metaValue(meta, 'topics') || '').toString().split(',').map((s) => s.trim()).filter(Boolean),\n      raw_text: JSON.stringify(r),\n      fetched_at: new Date().toISOString(),\n    },\n  });\n}\n\nreturn out;\n"
+      }
+    },
+    {
+      "id": "cascade_fetch",
+      "name": "Cascade Funding: Fetch Listing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -960,
+        460
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://cascadefunding.eu/calls",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "HTML source -- fragile by nature. See the Normalize node: 0 matched elements throws instead of silently reporting 'no calls'."
+    },
+    {
+      "id": "cascade_extract",
+      "name": "Cascade Funding: Parse Listing",
+      "type": "n8n-nodes-base.htmlExtract",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        460
+      ],
+      "parameters": {
+        "sourceData": "json",
+        "dataPropertyName": "data",
+        "extractionValues": {
+          "values": [
+            {
+              "key": "title",
+              "cssSelector": ".call-item h3",
+              "returnValue": "text",
+              "returnArray": true
+            },
+            {
+              "key": "url",
+              "cssSelector": ".call-item a",
+              "returnValue": "attribute",
+              "attribute": "href",
+              "returnArray": true
+            },
+            {
+              "key": "deadline_text",
+              "cssSelector": ".call-item .deadline",
+              "returnValue": "text",
+              "returnArray": true
+            },
+            {
+              "key": "summary_text",
+              "cssSelector": ".call-item .summary",
+              "returnValue": "text",
+              "returnArray": true
+            }
+          ]
+        }
+      },
+      "notes": "Placeholder selectors (.call-item / h3 / .deadline / .summary). Open the live page and update these before running for real -- see README > Limitations."
+    },
+    {
+      "id": "cascade_normalize",
+      "name": "Cascade Funding: Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        460
+      ],
+      "parameters": {
+        "language": "javaScript",
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Normalize the Cascade Funding portal listing into the canonical call\n// schema. HTML Extract returns one item holding parallel arrays (one\n// entry per matched element); we zip them back into individual calls.\n//\n// Per the architecture doc's reliability rule: a source that suddenly\n// returns zero elements almost always means its markup changed, not\n// that there are genuinely no open calls -- fail loudly instead of\n// silently reporting an empty result as \"nothing to report\".\n\nconst row = $input.first().json;\nconst titles = row.title || [];\nconst urls = row.url || [];\nconst deadlines = row.deadline_text || [];\nconst summaries = row.summary_text || [];\n\nif (titles.length === 0) {\n  throw new Error(\n    'Cascade Funding: 0 items matched the .call-item selector. ' +\n    'This almost certainly means the page markup changed, not that ' +\n    'there are no open calls -- check and update the CSS selectors.'\n  );\n}\n\nconst out = [];\nfor (let i = 0; i < titles.length; i++) {\n  const title = (titles[i] || '').trim();\n  if (!title) continue;\n  const url = urls[i] || '';\n  out.push({\n    json: {\n      source_code: 'cascadefunding',\n      external_id: (url.split('/').filter(Boolean).pop() || title).slice(0, 80),\n      title,\n      programme: 'Horizon Europe (Cascade / FSTP)',\n      type: 'cascade',\n      url,\n      summary: (summaries[i] || '').trim(),\n      amount_min_eur: null,\n      amount_max_eur: null,\n      deadline: (deadlines[i] || '').trim() || null,\n      deadline_type: 'single',\n      topics: [],\n      raw_text: title + '\\n' + (summaries[i] || '') + '\\n' + (deadlines[i] || ''),\n      fetched_at: new Date().toISOString(),\n    },\n  });\n}\n\nreturn out;\n"
+      }
+    },
+    {
+      "id": "merge_sources",
+      "name": "Merge Sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -240,
+        300
+      ],
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 2
+      }
+    },
+    {
+      "id": "prepare_dedup",
+      "name": "Prepare Dedup Keys",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "language": "javaScript",
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Compute both dedup keys used later in the pipeline.\n// Level 1 (per-source id) is hashed by the following Crypto node.\n// Level 2 (cross-source key) catches the same opportunity published on\n// more than one source. Level 3 from the architecture doc (embedding\n// similarity) is a roadmap item, not implemented in this MVP.\n\nreturn $input.all().map((item) => {\n  const j = item.json;\n  j.id_source_string = j.source_code + '::' + j.external_id;\n\n  const normTitle = (j.title || '')\n    .toLowerCase()\n    .normalize('NFKD')\n    .replace(/[\\u0300-\\u036f]/g, '')\n    .replace(/[^a-z0-9]+/g, ' ')\n    .trim();\n  const amountBucket = j.amount_max_eur ? Math.round(j.amount_max_eur / 10000) * 10000 : 'na';\n  j.cross_key = normTitle + '|' + (j.deadline || 'na') + '|' + amountBucket;\n\n  return { json: j };\n});\n"
+      }
+    },
+    {
+      "id": "hash_id",
+      "name": "Hash Call ID",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "action": "hash",
+        "binaryData": false,
+        "type": "SHA256",
+        "value": "={{$json.id_source_string}}",
+        "dataPropertyName": "id",
+        "encoding": "hex"
+      }
+    },
+    {
+      "id": "check_l1",
+      "name": "Check Not Seen (L1)",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "mode": "name",
+          "value": "raw_calls"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{$json.id}}"
+            }
+          ]
+        }
+      },
+      "notes": "Level-1 dedup: same source_code + external_id seen on a previous run. Requires a 'raw_calls' Data Table -- see README > Setup."
+    },
+    {
+      "id": "insert_raw",
+      "name": "Insert Raw",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "mode": "name",
+          "value": "raw_calls"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{$json.id}}",
+            "source_code": "={{$json.source_code}}",
+            "external_id": "={{$json.external_id}}",
+            "cross_key": "={{$json.cross_key}}",
+            "title": "={{$json.title}}",
+            "programme": "={{$json.programme}}",
+            "type": "={{$json.type}}",
+            "url": "={{$json.url}}",
+            "summary": "={{$json.summary}}",
+            "amount_min_eur": "={{$json.amount_min_eur}}",
+            "amount_max_eur": "={{$json.amount_max_eur}}",
+            "deadline": "={{$json.deadline}}",
+            "deadline_type": "={{$json.deadline_type}}",
+            "topics": "={{JSON.stringify($json.topics)}}",
+            "raw_text": "={{$json.raw_text}}",
+            "fetched_at": "={{$json.fetched_at}}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        }
+      }
+    },
+    {
+      "id": "check_l2",
+      "name": "Check Not Duplicate (L2)",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "mode": "name",
+          "value": "calls"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "cross_key",
+              "condition": "eq",
+              "keyValue": "={{$json.cross_key}}"
+            }
+          ]
+        }
+      },
+      "notes": "Level-2 dedup: same opportunity already stored under a different source_code. MVP simplification of the doc's 'keep highest completeness, others to aliases' rule -- here the first-seen source simply wins and later duplicates are dropped."
+    },
+    {
+      "id": "extract_eligibility",
+      "name": "Extract Eligibility Criteria",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "text": "={{$json.raw_text}}",
+        "schemaType": "manual",
+        "inputSchema": "{\"type\": \"object\", \"properties\": {\"consortium_required\": {\"type\": [\"boolean\", \"null\"], \"description\": \"Whether the call requires a multi-partner consortium\"}, \"consortium_required_quote\": {\"type\": [\"string\", \"null\"], \"description\": \"Verbatim sentence from the source text supporting consortium_required. Must be an exact substring of the input.\"}, \"min_partners\": {\"type\": [\"number\", \"null\"], \"description\": \"Minimum number of partner organisations required\"}, \"min_partners_quote\": {\"type\": [\"string\", \"null\"], \"description\": \"Verbatim supporting sentence, exact substring of the input\"}, \"min_countries\": {\"type\": [\"number\", \"null\"], \"description\": \"Minimum number of different eligible countries required\"}, \"min_countries_quote\": {\"type\": [\"string\", \"null\"], \"description\": \"Verbatim supporting sentence, exact substring of the input\"}, \"applicant_types\": {\"type\": [\"array\", \"null\"], \"items\": {\"type\": \"string\"}, \"description\": \"Eligible applicant types, e.g. sme, startup, research, public, ngo, natural_person\"}, \"applicant_types_quote\": {\"type\": [\"string\", \"null\"], \"description\": \"Verbatim supporting sentence, exact substring of the input\"}, \"trl_min\": {\"type\": [\"number\", \"null\"], \"description\": \"Minimum required Technology Readiness Level\"}, \"trl_max\": {\"type\": [\"number\", \"null\"], \"description\": \"Maximum required Technology Readiness Level\"}, \"trl_quote\": {\"type\": [\"string\", \"null\"], \"description\": \"Verbatim supporting sentence, exact substring of the input\"}, \"cofinancing_pct\": {\"type\": [\"number\", \"null\"], \"description\": \"Percentage of project cost the applicant must co-finance\"}, \"cofinancing_pct_quote\": {\"type\": [\"string\", \"null\"], \"description\": \"Verbatim supporting sentence, exact substring of the input\"}}, \"required\": []}"
+      },
+      "notes": "Every extracted field is paired with a *_quote field. The next node (Validate Citations & Score) drops any field whose quote is not a literal substring of raw_text -- see README > Design notes."
+    },
+    {
+      "id": "anthropic_model",
+      "name": "Anthropic Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.5,
+      "position": [
+        1200,
+        500
+      ],
+      "parameters": {
+        "model": {
+          "mode": "id",
+          "value": "claude-sonnet-4-6"
+        }
+      }
+    },
+    {
+      "id": "validate_citations",
+      "name": "Validate Citations & Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        300
+      ],
+      "parameters": {
+        "language": "javaScript",
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Runs once per item. $json is this item's Information Extractor output\n// (the extracted eligibility fields). $('Check Not Duplicate (L2)').item.json\n// is the same call's canonical record from before the LLM step -- n8n's\n// paired-item tracking keeps these aligned even though earlier nodes\n// filtered some items out.\n\nconst extracted = $json.output || $json;\nconst call = $('Check Not Duplicate (L2)').item.json;\nconst rawText = call.raw_text || '';\n\nconst fieldPairs = [\n  ['consortium_required', 'consortium_required_quote'],\n  ['min_partners', 'min_partners_quote'],\n  ['min_countries', 'min_countries_quote'],\n  ['applicant_types', 'applicant_types_quote'],\n  ['trl_min', 'trl_quote'],\n  ['trl_max', 'trl_quote'],\n  ['cofinancing_pct', 'cofinancing_pct_quote'],\n];\n\nconst eligibility = {};\nconst droppedFields = [];\nlet checkedCount = 0;\nlet validCount = 0;\n\nfor (const [field, quoteField] of fieldPairs) {\n  const value = extracted[field];\n  if (value === undefined || value === null || value === '') continue;\n  checkedCount += 1;\n  const quote = extracted[quoteField];\n  const quoteOk = typeof quote === 'string' && quote.length > 0 && rawText.includes(quote);\n  if (quoteOk) {\n    eligibility[field] = value;\n    validCount += 1;\n  } else {\n    droppedFields.push(field);\n  }\n}\n\nconst extractionConfidence = checkedCount > 0 ? Math.round((validCount / checkedCount) * 100) / 100 : 0;\n\nconst canonicalFields = ['title', 'url', 'summary', 'deadline', 'amount_max_eur', 'programme'];\nconst filledCanonical = canonicalFields.filter((f) => call[f] !== null && call[f] !== undefined && call[f] !== '').length;\nconst completeness = Math.round((filledCanonical / canonicalFields.length) * 100) / 100;\n\nreturn {\n  json: Object.assign({}, call, {\n    eligibility,\n    dropped_fields: droppedFields,\n    extraction_confidence: extractionConfidence,\n    completeness,\n    first_seen_at: new Date().toISOString(),\n    last_seen_at: new Date().toISOString(),\n    notified: false,\n  }),\n};\n"
+      }
+    },
+    {
+      "id": "insert_call",
+      "name": "Insert Call",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "mode": "name",
+          "value": "calls"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{$json.id}}",
+            "source_code": "={{$json.source_code}}",
+            "external_id": "={{$json.external_id}}",
+            "cross_key": "={{$json.cross_key}}",
+            "title": "={{$json.title}}",
+            "programme": "={{$json.programme}}",
+            "type": "={{$json.type}}",
+            "url": "={{$json.url}}",
+            "summary": "={{$json.summary}}",
+            "amount_min_eur": "={{$json.amount_min_eur}}",
+            "amount_max_eur": "={{$json.amount_max_eur}}",
+            "deadline": "={{$json.deadline}}",
+            "deadline_type": "={{$json.deadline_type}}",
+            "topics": "={{JSON.stringify($json.topics)}}",
+            "eligibility": "={{JSON.stringify($json.eligibility)}}",
+            "dropped_fields": "={{JSON.stringify($json.dropped_fields)}}",
+            "extraction_confidence": "={{$json.extraction_confidence}}",
+            "completeness": "={{$json.completeness}}",
+            "first_seen_at": "={{$json.first_seen_at}}",
+            "last_seen_at": "={{$json.last_seen_at}}",
+            "notified": false
+          },
+          "matchingColumns": [],
+          "schema": []
+        }
+      }
+    },
+    {
+      "id": "get_unnotified",
+      "name": "Get Unnotified Calls",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1920,
+        300
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "mode": "name",
+          "value": "calls"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "notified",
+              "condition": "eq",
+              "keyValue": false
+            }
+          ]
+        },
+        "returnAll": true
+      },
+      "notes": "alwaysOutputData is ON so the pipeline still runs (and sends the 'no matches' digest) when there is nothing pending. Reads across ALL runs, not just today's -- so a call that matched the profile but wasn't sent yet (e.g. after an error) is retried next run."
+    },
+    {
+      "id": "apply_profile",
+      "name": "Apply Recipient Profile",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        300
+      ],
+      "parameters": {
+        "language": "javaScript",
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Recipient profile drives filtering. In production this would be\n// loaded from a Data Table row or one of the profiles/*.json files in\n// this repo, so switching applicants doesn't touch the pipeline logic.\n// Inlined here for MVP simplicity -- swap PROFILE or wire it up to a\n// lookup if you need more than one recipient.\n\nconst PROFILE = {\n  id: 'solo-software',\n  countries: ['ES', 'UA', 'PL'],\n  entity_types: ['sme', 'startup', 'natural_person'],\n  consortium: false,\n  max_partners: 2,\n  trl: [3, 6],\n  cofinancing_max_pct: 20,\n  amount: [20000, 300000],\n  deadline_min_days: 10,\n  domains_include: ['ai', 'data', 'cybersecurity', 'digital', 'open-source'],\n  domains_exclude: ['agriculture', 'construction', 'clinical-trials', 'maritime-hardware'],\n};\n\nconst items = $input.all();\nconst evaluated = [];\n\nfor (const item of items) {\n  const call = item.json;\n  if (!call.id) continue; // alwaysOutputData empty-shell item when nothing pending\n\n  const matched = [];\n  const softFlags = [];\n  const hardReasons = [];\n  const e = call.eligibility || {};\n\n  if (e.min_partners && e.min_partners > PROFILE.max_partners) {\n    hardReasons.push('needs ' + e.min_partners + ' partners, profile allows ' + PROFILE.max_partners);\n  } else {\n    matched.push('consortium size');\n  }\n\n  if (call.deadline) {\n    const days = (new Date(call.deadline) - new Date()) / 86400000;\n    if (!Number.isNaN(days) && days < PROFILE.deadline_min_days) {\n      hardReasons.push('deadline in ' + Math.max(0, Math.round(days)) + ' days, need ' + PROFILE.deadline_min_days + '+');\n    } else {\n      matched.push('deadline window');\n    }\n  }\n\n  if (e.trl_min && e.trl_min > PROFILE.trl[1]) {\n    softFlags.push('min TRL ' + e.trl_min + ' above profile max ' + PROFILE.trl[1]);\n  } else if (e.trl_max && e.trl_max < PROFILE.trl[0]) {\n    softFlags.push('max TRL ' + e.trl_max + ' below profile min ' + PROFILE.trl[0]);\n  } else {\n    matched.push('TRL range');\n  }\n\n  if (e.cofinancing_pct && e.cofinancing_pct > PROFILE.cofinancing_max_pct) {\n    softFlags.push('co-financing ' + e.cofinancing_pct + '% above profile max ' + PROFILE.cofinancing_max_pct + '%');\n  } else {\n    matched.push('co-financing');\n  }\n\n  if (call.amount_max_eur && call.amount_max_eur < PROFILE.amount[0]) {\n    softFlags.push('budget below profile minimum');\n  } else {\n    matched.push('budget range');\n  }\n\n  const topics = call.topics || [];\n  if (topics.some((t) => PROFILE.domains_exclude.includes(t))) {\n    hardReasons.push('topic in domains_exclude');\n  } else if (topics.length && !topics.some((t) => PROFILE.domains_include.includes(t))) {\n    softFlags.push('no overlap with domains_include');\n  } else {\n    matched.push('domain');\n  }\n\n  evaluated.push(Object.assign({}, call, {\n    matched_conditions: matched,\n    soft_flags: softFlags,\n    hard_exclude: hardReasons.length > 0,\n    hard_reasons: hardReasons,\n  }));\n}\n\nconst eligible = evaluated.filter((c) => !c.hard_exclude);\neligible.sort((a, b) => new Date(a.deadline || '9999-12-31') - new Date(b.deadline || '9999-12-31'));\nconst top = eligible.slice(0, 5);\n\nreturn [{ json: { matched: top, matched_count: top.length, total_unnotified: items.length } }];\n"
+      }
+    },
+    {
+      "id": "split_matched",
+      "name": "Split Out Matched",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        2400,
+        180
+      ],
+      "parameters": {
+        "fieldToSplitOut": "matched",
+        "include": "noOtherFields"
+      }
+    },
+    {
+      "id": "mark_notified",
+      "name": "Mark Notified",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2640,
+        180
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "mode": "name",
+          "value": "calls"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{$json.id}}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "notified": true,
+            "last_seen_at": "={{new Date().toISOString()}}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        }
+      }
+    },
+    {
+      "id": "build_digest",
+      "name": "Build Digest Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        420
+      ],
+      "parameters": {
+        "language": "javaScript",
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Builds the Slack digest. An empty digest is a valid, expected result\n// (architecture doc, section 8) -- it still gets sent as one line so\n// silence is never ambiguous with \"the workflow is broken\".\n\nconst data = $input.first().json;\nconst matched = data.matched || [];\n\nfunction formatAmount(min, max) {\n  if (!min && !max) return 'amount not extracted';\n  if (min && max) return '€' + min.toLocaleString() + '–€' + max.toLocaleString();\n  return 'up to €' + (max || min).toLocaleString();\n}\n\nlet text;\nif (matched.length === 0) {\n  text = '*EU Funding Radar* — ' + new Date().toISOString().slice(0, 10) + ': no new calls matched the profile today.';\n} else {\n  const lines = matched.map((c, i) => {\n    const flags = (c.soft_flags || []).length ? ' _(check: ' + c.soft_flags.join('; ') + ')_' : '';\n    return (i + 1) + '. *<' + c.url + '|' + c.title + '>* — ' + c.programme + '\\n   Deadline: ' + (c.deadline || 'n/a') + ' · ' + formatAmount(c.amount_min_eur, c.amount_max_eur) + flags;\n  });\n  text = '*EU Funding Radar* — ' + matched.length + ' new call(s):\\n\\n' + lines.join('\\n\\n');\n}\n\nreturn [{ json: { digest_text: text } }];\n"
+      }
+    },
+    {
+      "id": "slack_post",
+      "name": "Post Digest",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.5,
+      "position": [
+        2640,
+        420
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "mode": "name",
+          "value": "#eu-funding-radar"
+        },
+        "text": "={{$json.digest_text}}"
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Daily 08:00": {
+      "main": [
+        [
+          {
+            "node": "FTOP: Search Calls",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Cascade Funding: Fetch Listing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "FTOP: Search Calls": {
+      "main": [
+        [
+          {
+            "node": "FTOP: Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "FTOP: Normalize": {
+      "main": [
+        [
+          {
+            "node": "Merge Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cascade Funding: Fetch Listing": {
+      "main": [
+        [
+          {
+            "node": "Cascade Funding: Parse Listing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cascade Funding: Parse Listing": {
+      "main": [
+        [
+          {
+            "node": "Cascade Funding: Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cascade Funding: Normalize": {
+      "main": [
+        [
+          {
+            "node": "Merge Sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Sources": {
+      "main": [
+        [
+          {
+            "node": "Prepare Dedup Keys",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Dedup Keys": {
+      "main": [
+        [
+          {
+            "node": "Hash Call ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash Call ID": {
+      "main": [
+        [
+          {
+            "node": "Check Not Seen (L1)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Not Seen (L1)": {
+      "main": [
+        [
+          {
+            "node": "Insert Raw",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Raw": {
+      "main": [
+        [
+          {
+            "node": "Check Not Duplicate (L2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Not Duplicate (L2)": {
+      "main": [
+        [
+          {
+            "node": "Extract Eligibility Criteria",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Extract Eligibility Criteria",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Eligibility Criteria": {
+      "main": [
+        [
+          {
+            "node": "Validate Citations & Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Citations & Score": {
+      "main": [
+        [
+          {
+            "node": "Insert Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Call": {
+      "main": [
+        [
+          {
+            "node": "Get Unnotified Calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Unnotified Calls": {
+      "main": [
+        [
+          {
+            "node": "Apply Recipient Profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Recipient Profile": {
+      "main": [
+        [
+          {
+            "node": "Split Out Matched",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Digest Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out Matched": {
+      "main": [
+        [
+          {
+            "node": "Mark Notified",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Digest Text": {
+      "main": [
+        [
+          {
+            "node": "Post Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
